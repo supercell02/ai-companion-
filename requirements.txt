@@ -1,0 +1,6 @@
+openai
+textual
+python-dotenv
+pydantic
+pydantic-settings
+numpy
