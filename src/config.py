@@ -5,7 +5,7 @@ class Config(BaseSettings):
     db_path: str = "companion_memory.db"
     model_response: str = "gpt-4o-mini"
     model_logic: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "text-embedding-3-large"
     
     class Config:
         env_file = ".env"

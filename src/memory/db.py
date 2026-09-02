@@ -1,237 +1,1160 @@
-import aiosqlite
 import json
-from datetime import datetime
+import aiosqlite
 from typing import Optional, List
+
 
 class MemoryDB:
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
-    
+
     async def initialize(self):
-        """Create tables if they don't exist"""
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS entities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    entity_type TEXT NOT NULL DEFAULT 'person',
+                    relationship TEXT,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(name, entity_type)
+                )
+            """)
+
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    content TEXT UNIQUE NOT NULL,
+                    entity_id INTEGER,
+                    content TEXT NOT NULL,
                     category TEXT NOT NULL,
-                    embedding BLOB,
+                    embedding TEXT,
+                    confidence REAL DEFAULT 1.0,
+                    importance REAL DEFAULT 0.5,
+                    access_count INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    access_count INTEGER DEFAULT 0
+                    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
                 )
             """)
-            
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_message TEXT NOT NULL,
+                    assistant_response TEXT NOT NULL,
+                    turn_number INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS personality_traits (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     trait_name TEXT UNIQUE NOT NULL,
                     trait_value TEXT NOT NULL,
+                    confidence REAL DEFAULT 1.0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Create index on category for faster lookups
+
             await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_facts_category 
+                CREATE TABLE IF NOT EXISTS entity_relationships (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_entity_id INTEGER NOT NULL,
+                    relationship_type TEXT NOT NULL,
+                    target_entity_id INTEGER NOT NULL,
+                    confidence REAL DEFAULT 1.0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (source_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+                    UNIQUE(source_entity_id, relationship_type, target_entity_id)
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS memory_access_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fact_id INTEGER NOT NULL,
+                    query TEXT,
+                    similarity REAL,
+                    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (fact_id) REFERENCES facts(id) ON DELETE CASCADE
+                )
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_entities_name
+                ON entities(name)
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_facts_entity
+                ON facts(entity_id)
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_facts_category
                 ON facts(category)
             """)
-            
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_facts_updated_at
+                ON facts(updated_at)
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_relationship_source
+                ON entity_relationships(source_entity_id)
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_relationship_target
+                ON entity_relationships(target_entity_id)
+            """)
+
             await db.commit()
-    
-    async def store_fact(self, content: str, embedding: list, category: str):
-        """Store a fact - with deduplication"""
-        embedding_blob = json.dumps(embedding)
-        
+
+    async def get_or_create_entity(
+        self,
+        name: str,
+        entity_type: str = "person",
+        relationship: Optional[str] = None,
+        description: Optional[str] = None
+    ) -> dict:
+        name = name.strip()
+        entity_type = entity_type.strip().lower()
+
+        if not name:
+            raise ValueError("Entity name cannot be empty")
+
         async with aiosqlite.connect(self.db_path) as db:
-            try:
-                # Check if fact already exists
-                cursor = await db.execute(
-                    "SELECT id FROM facts WHERE content = ?",
-                    (content,)
-                )
-                existing = await cursor.fetchone()
-                
-                if existing:
-                    # Update existing fact
-                    await db.execute(
-                        """UPDATE facts 
-                           SET embedding = ?, category = ?, updated_at = CURRENT_TIMESTAMP,
-                               access_count = access_count + 1
-                           WHERE id = ?""",
-                        (embedding_blob, category, existing[0])
-                    )
-                    print(f"[UPDATE] Fact already exists: '{content}'")
-                else:
-                    # Insert new fact
-                    await db.execute(
-                        """INSERT INTO facts (content, embedding, category) 
-                           VALUES (?, ?, ?)""",
-                        (content, embedding_blob, category)
-                    )
-                    print(f"[INSERT] New fact: '{content}'")
-                
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    id,
+                    name,
+                    entity_type,
+                    relationship,
+                    description,
+                    created_at,
+                    updated_at
+                FROM entities
+                WHERE LOWER(name) = LOWER(?)
+                AND entity_type = ?
+                LIMIT 1
+            """, (name, entity_type))
+
+            row = await cursor.fetchone()
+
+            if row:
+                await db.execute("""
+                    UPDATE entities
+                    SET
+                        relationship = COALESCE(?, relationship),
+                        description = COALESCE(?, description),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    relationship,
+                    description,
+                    row["id"]
+                ))
+
                 await db.commit()
-            except Exception as e:
-                print(f"Error storing fact: {e}")
-                await db.rollback()
-    
-    async def delete_fact(self, fact_id: int):
-        """Delete a fact by ID"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+
+                cursor = await db.execute("""
+                    SELECT
+                        id,
+                        name,
+                        entity_type,
+                        relationship,
+                        description,
+                        created_at,
+                        updated_at
+                    FROM entities
+                    WHERE id = ?
+                """, (row["id"],))
+
+                updated = await cursor.fetchone()
+                return dict(updated)
+
+            cursor = await db.execute("""
+                INSERT INTO entities (
+                    name,
+                    entity_type,
+                    relationship,
+                    description
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                name,
+                entity_type,
+                relationship,
+                description
+            ))
+
+            entity_id = cursor.lastrowid
+
             await db.commit()
-    
-    async def delete_fact_by_content(self, content: str):
-        """Delete a fact by its content"""
+
+            cursor = await db.execute("""
+                SELECT
+                    id,
+                    name,
+                    entity_type,
+                    relationship,
+                    description,
+                    created_at,
+                    updated_at
+                FROM entities
+                WHERE id = ?
+            """, (entity_id,))
+
+            row = await cursor.fetchone()
+            return dict(row)
+
+    async def get_entity_by_name(
+        self,
+        name: str,
+        entity_type: Optional[str] = None
+    ) -> Optional[dict]:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM facts WHERE content = ?", (content,))
+            db.row_factory = aiosqlite.Row
+
+            if entity_type:
+                cursor = await db.execute("""
+                    SELECT
+                        id,
+                        name,
+                        entity_type,
+                        relationship,
+                        description,
+                        created_at,
+                        updated_at
+                    FROM entities
+                    WHERE LOWER(name) = LOWER(?)
+                    AND entity_type = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """, (
+                    name.strip(),
+                    entity_type.strip().lower()
+                ))
+            else:
+                cursor = await db.execute("""
+                    SELECT
+                        id,
+                        name,
+                        entity_type,
+                        relationship,
+                        description,
+                        created_at,
+                        updated_at
+                    FROM entities
+                    WHERE LOWER(name) = LOWER(?)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """, (name.strip(),))
+
+            row = await cursor.fetchone()
+
+            return dict(row) if row else None
+
+    async def get_entities_by_name(self, name: str) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    id,
+                    name,
+                    entity_type,
+                    relationship,
+                    description,
+                    created_at,
+                    updated_at
+                FROM entities
+                WHERE LOWER(name) = LOWER(?)
+                ORDER BY updated_at DESC
+            """, (name.strip(),))
+
+            rows = await cursor.fetchall()
+
+            return [dict(row) for row in rows]
+
+    async def get_all_entities(self) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    id,
+                    name,
+                    entity_type,
+                    relationship,
+                    description,
+                    created_at,
+                    updated_at
+                FROM entities
+                ORDER BY updated_at DESC
+            """)
+
+            rows = await cursor.fetchall()
+
+            return [dict(row) for row in rows]
+
+    async def store_relationship(
+        self,
+        source_entity_id: int,
+        relationship_type: str,
+        target_entity_id: int,
+        confidence: float = 1.0
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                SELECT id
+                FROM entity_relationships
+                WHERE source_entity_id = ?
+                AND relationship_type = ?
+                AND target_entity_id = ?
+            """, (
+                source_entity_id,
+                relationship_type.strip().lower(),
+                target_entity_id
+            ))
+
+            existing = await cursor.fetchone()
+
+            if existing:
+                await db.execute("""
+                    UPDATE entity_relationships
+                    SET
+                        confidence = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    confidence,
+                    existing[0]
+                ))
+            else:
+                await db.execute("""
+                    INSERT INTO entity_relationships (
+                        source_entity_id,
+                        relationship_type,
+                        target_entity_id,
+                        confidence
+                    )
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    source_entity_id,
+                    relationship_type.strip().lower(),
+                    target_entity_id,
+                    confidence
+                ))
+
             await db.commit()
-    
+
+    async def get_relationships(
+        self,
+        entity_id: int
+    ) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    r.id,
+                    r.relationship_type,
+                    r.confidence,
+                    r.created_at,
+                    r.updated_at,
+                    e.id AS target_entity_id,
+                    e.name AS target_name,
+                    e.entity_type AS target_entity_type,
+                    e.relationship AS target_relationship
+                FROM entity_relationships r
+                JOIN entities e
+                    ON e.id = r.target_entity_id
+                WHERE r.source_entity_id = ?
+                ORDER BY r.updated_at DESC
+            """, (entity_id,))
+
+            rows = await cursor.fetchall()
+
+            return [dict(row) for row in rows]
+
+    async def store_fact(
+        self,
+        content: str,
+        embedding: list,
+        category: str,
+        entity_id: Optional[int] = None,
+        confidence: float = 1.0,
+        importance: float = 0.5
+    ) -> Optional[dict]:
+        content = content.strip()
+        category = category.strip().lower()
+
+        if not content:
+            return None
+
+        embedding_blob = json.dumps(embedding) if embedding else None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            if entity_id is not None:
+                cursor = await db.execute("""
+                    SELECT id
+                    FROM facts
+                    WHERE entity_id = ?
+                    AND content = ?
+                    LIMIT 1
+                """, (entity_id, content))
+            else:
+                cursor = await db.execute("""
+                    SELECT id
+                    FROM facts
+                    WHERE entity_id IS NULL
+                    AND content = ?
+                    LIMIT 1
+                """, (content,))
+
+            existing = await cursor.fetchone()
+
+            if existing:
+                await db.execute("""
+                    UPDATE facts
+                    SET
+                        embedding = COALESCE(?, embedding),
+                        category = ?,
+                        confidence = ?,
+                        importance = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    embedding_blob,
+                    category,
+                    confidence,
+                    importance,
+                    existing["id"]
+                ))
+
+                fact_id = existing["id"]
+            else:
+                cursor = await db.execute("""
+                    INSERT INTO facts (
+                        entity_id,
+                        content,
+                        category,
+                        embedding,
+                        confidence,
+                        importance
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    entity_id,
+                    content,
+                    category,
+                    embedding_blob,
+                    confidence,
+                    importance
+                ))
+
+                fact_id = cursor.lastrowid
+
+            await db.commit()
+
+            cursor = await db.execute("""
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                LEFT JOIN entities e
+                    ON e.id = f.entity_id
+                WHERE f.id = ?
+            """, (fact_id,))
+
+            row = await cursor.fetchone()
+
+            return dict(row) if row else None
+
+    async def get_fact_by_id(
+        self,
+        fact_id: int
+    ) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.embedding,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                LEFT JOIN entities e
+                    ON e.id = f.entity_id
+                WHERE f.id = ?
+            """, (fact_id,))
+
+            row = await cursor.fetchone()
+
+            if not row:
+                return None
+
+            result = dict(row)
+
+            if result.get("embedding"):
+                result["embedding"] = json.loads(result["embedding"])
+
+            return result
+
     async def get_all_facts(self) -> List[dict]:
-        """Retrieve all facts ordered by recency and access"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+
             cursor = await db.execute("""
-                SELECT id, content, category, created_at, updated_at, access_count
-                FROM facts
-                ORDER BY updated_at DESC, access_count DESC
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                LEFT JOIN entities e
+                    ON e.id = f.entity_id
+                ORDER BY
+                    f.updated_at DESC,
+                    f.importance DESC
             """)
+
             rows = await cursor.fetchall()
+
             return [dict(row) for row in rows]
-    
-    async def get_similar_facts(self, embedding: list, threshold: float = 0.7, limit: int = 10) -> List[dict]:
-        """
-        Retrieve facts similar to the query embedding.
-        IMPORTANT: Also includes recent facts even if similarity is moderate.
-        """
+
+    async def get_facts_for_entity(
+        self,
+        entity_id: int,
+        limit: int = 50
+    ) -> List[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            
-            # Get all facts with embeddings
+
             cursor = await db.execute("""
-                SELECT id, content, category, embedding, created_at, updated_at, access_count
-                FROM facts
-                ORDER BY updated_at DESC
-            """)
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                JOIN entities e
+                    ON e.id = f.entity_id
+                WHERE f.entity_id = ?
+                ORDER BY
+                    f.importance DESC,
+                    f.updated_at DESC
+                LIMIT ?
+            """, (
+                entity_id,
+                limit
+            ))
+
             rows = await cursor.fetchall()
-            
-            scored_facts = []
-            
-            for row in rows:
-                fact_dict = dict(row)
-                
-                if row['embedding']:
-                    embedding_list = json.loads(row['embedding'])
-                    similarity = self._cosine_similarity(embedding, embedding_list)
-                else:
-                    similarity = 0.0
-                
-                # HYBRID SCORING: Combine similarity + recency + access frequency
-                # Recent facts get a boost even if similarity is moderate
-                recency_score = self._get_recency_score(row['updated_at'])
-                access_score = min(row['access_count'] / 10.0, 1.0)  # Cap at 1.0
-                
-                # Weighted combination: 50% similarity, 30% recency, 20% access
-                combined_score = (similarity * 0.5) + (recency_score * 0.3) + (access_score * 0.2)
-                
-                fact_dict['similarity'] = similarity
-                fact_dict['combined_score'] = combined_score
-                scored_facts.append(fact_dict)
-            
-            # Sort by combined score and return top N
-            scored_facts.sort(key=lambda x: x['combined_score'], reverse=True)
-            
-            # ALWAYS include facts above threshold OR very recent facts
-            filtered = [
-                f for f in scored_facts 
-                if f['similarity'] >= threshold or f['combined_score'] >= 0.6
-            ]
-            
-            # If we have results, return top limit. Otherwise return all top facts.
-            return filtered[:limit] if filtered else scored_facts[:limit]
-    
-    async def get_facts_by_category(self, category: str) -> List[dict]:
-        """Get all facts in a specific category"""
+
+            return [dict(row) for row in rows]
+
+    async def get_facts_by_category(
+        self,
+        category: str
+    ) -> List[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+
             cursor = await db.execute("""
-                SELECT id, content, category, created_at, updated_at, access_count
-                FROM facts
-                WHERE category = ?
-                ORDER BY updated_at DESC
-            """, (category,))
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                LEFT JOIN entities e
+                    ON e.id = f.entity_id
+                WHERE f.category = ?
+                ORDER BY f.updated_at DESC
+            """, (category.strip().lower(),))
+
             rows = await cursor.fetchall()
+
             return [dict(row) for row in rows]
-    
-    async def store_personality_trait(self, trait_name: str, trait_value: str):
-        """Store or update a personality trait"""
+
+    async def get_facts_for_entity_and_category(
+        self,
+        entity_id: int,
+        category: str
+    ) -> List[dict]:
         async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                LEFT JOIN entities e
+                    ON e.id = f.entity_id
+                WHERE f.entity_id = ?
+                AND f.category = ?
+                ORDER BY f.updated_at DESC
+            """, (
+                entity_id,
+                category.strip().lower()
+            ))
+
+            rows = await cursor.fetchall()
+
+            return [dict(row) for row in rows]
+
+    async def get_similar_facts(
+        self,
+        embedding: list,
+        threshold: float = 0.70,
+        limit: int = 10,
+        entity_id: Optional[int] = None
+    ) -> List[dict]:
+        if not embedding:
+            return []
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            if entity_id is not None:
+                cursor = await db.execute("""
+                    SELECT
+                        f.id,
+                        f.entity_id,
+                        f.content,
+                        f.category,
+                        f.embedding,
+                        f.confidence,
+                        f.importance,
+                        f.access_count,
+                        f.created_at,
+                        f.updated_at,
+                        e.name AS entity_name,
+                        e.entity_type,
+                        e.relationship
+                    FROM facts f
+                    LEFT JOIN entities e
+                        ON e.id = f.entity_id
+                    WHERE f.embedding IS NOT NULL
+                    AND f.entity_id = ?
+                """, (entity_id,))
+            else:
+                cursor = await db.execute("""
+                    SELECT
+                        f.id,
+                        f.entity_id,
+                        f.content,
+                        f.category,
+                        f.embedding,
+                        f.confidence,
+                        f.importance,
+                        f.access_count,
+                        f.created_at,
+                        f.updated_at,
+                        e.name AS entity_name,
+                        e.entity_type,
+                        e.relationship
+                    FROM facts f
+                    LEFT JOIN entities e
+                        ON e.id = f.entity_id
+                    WHERE f.embedding IS NOT NULL
+                """)
+
+            rows = await cursor.fetchall()
+
+        scored = []
+
+        for row in rows:
+            fact = dict(row)
+
             try:
-                cursor = await db.execute(
-                    "SELECT id FROM personality_traits WHERE trait_name = ?",
-                    (trait_name,)
+                stored_embedding = json.loads(fact["embedding"])
+                similarity = self._cosine_similarity(
+                    embedding,
+                    stored_embedding
                 )
-                existing = await cursor.fetchone()
-                
-                if existing:
-                    await db.execute(
-                        """UPDATE personality_traits 
-                           SET trait_value = ?, updated_at = CURRENT_TIMESTAMP
-                           WHERE trait_name = ?""",
-                        (trait_value, trait_name)
+            except Exception:
+                similarity = 0.0
+
+            fact.pop("embedding", None)
+
+            fact["similarity"] = similarity
+
+            if similarity >= threshold:
+                scored.append(fact)
+
+        scored.sort(
+            key=lambda x: x["similarity"],
+            reverse=True
+        )
+
+        results = scored[:limit]
+
+        if results:
+            await self._record_memory_accesses(
+                results,
+                None
+            )
+
+        return results
+
+    async def search_entity_facts(
+        self,
+        entity_name: str,
+        embedding: Optional[list] = None,
+        threshold: float = 0.60,
+        limit: int = 10
+    ) -> List[dict]:
+        entity = await self.get_entity_by_name(entity_name)
+
+        if not entity:
+            return []
+
+        if embedding:
+            return await self.get_similar_facts(
+                embedding=embedding,
+                threshold=threshold,
+                limit=limit,
+                entity_id=entity["id"]
+            )
+
+        return await self.get_facts_for_entity(
+            entity["id"],
+            limit
+        )
+
+    async def increment_access_count(
+        self,
+        fact_id: int
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE facts
+                SET access_count = access_count + 1
+                WHERE id = ?
+            """, (fact_id,))
+
+            await db.commit()
+
+    async def _record_memory_accesses(
+        self,
+        facts: List[dict],
+        query: Optional[str]
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            for fact in facts:
+                fact_id = fact.get("id")
+
+                if not fact_id:
+                    continue
+
+                similarity = fact.get("similarity")
+
+                await db.execute("""
+                    UPDATE facts
+                    SET access_count = access_count + 1
+                    WHERE id = ?
+                """, (fact_id,))
+
+                await db.execute("""
+                    INSERT INTO memory_access_log (
+                        fact_id,
+                        query,
+                        similarity
                     )
-                else:
-                    await db.execute(
-                        """INSERT INTO personality_traits (trait_name, trait_value)
-                           VALUES (?, ?)""",
-                        (trait_name, trait_value)
-                    )
-                
-                await db.commit()
-            except Exception as e:
-                print(f"Error storing personality trait: {e}")
-                await db.rollback()
-    
-    async def get_personality_traits(self) -> List[dict]:
-        """Get all personality traits"""
+                    VALUES (?, ?, ?)
+                """, (
+                    fact_id,
+                    query,
+                    similarity
+                ))
+
+            await db.commit()
+
+    async def delete_fact(
+        self,
+        fact_id: int
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                DELETE FROM facts
+                WHERE id = ?
+            """, (fact_id,))
+
+            await db.commit()
+
+    async def delete_fact_by_content(
+        self,
+        content: str
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                DELETE FROM facts
+                WHERE content = ?
+            """, (content,))
+
+            await db.commit()
+
+    async def delete_fact_for_entity(
+        self,
+        entity_id: int,
+        content: str
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                DELETE FROM facts
+                WHERE entity_id = ?
+                AND content = ?
+            """, (
+                entity_id,
+                content
+            ))
+
+            await db.commit()
+
+    async def update_fact(
+        self,
+        fact_id: int,
+        content: Optional[str] = None,
+        embedding: Optional[list] = None,
+        category: Optional[str] = None,
+        confidence: Optional[float] = None,
+        importance: Optional[float] = None
+    ) -> Optional[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+
+            embedding_blob = (
+                json.dumps(embedding)
+                if embedding
+                else None
+            )
+
+            await db.execute("""
+                UPDATE facts
+                SET
+                    content = COALESCE(?, content),
+                    embedding = COALESCE(?, embedding),
+                    category = COALESCE(?, category),
+                    confidence = COALESCE(?, confidence),
+                    importance = COALESCE(?, importance),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                content,
+                embedding_blob,
+                category.strip().lower() if category else None,
+                confidence,
+                importance,
+                fact_id
+            ))
+
+            await db.commit()
+
             cursor = await db.execute("""
-                SELECT trait_name, trait_value, updated_at
+                SELECT
+                    f.id,
+                    f.entity_id,
+                    f.content,
+                    f.category,
+                    f.confidence,
+                    f.importance,
+                    f.access_count,
+                    f.created_at,
+                    f.updated_at,
+                    e.name AS entity_name,
+                    e.entity_type,
+                    e.relationship
+                FROM facts f
+                LEFT JOIN entities e
+                    ON e.id = f.entity_id
+                WHERE f.id = ?
+            """, (fact_id,))
+
+            row = await cursor.fetchone()
+
+            return dict(row) if row else None
+
+    async def store_conversation(
+        self,
+        user_message: str,
+        assistant_response: str,
+        turn_number: Optional[int] = None
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO conversations (
+                    user_message,
+                    assistant_response,
+                    turn_number
+                )
+                VALUES (?, ?, ?)
+            """, (
+                user_message,
+                assistant_response,
+                turn_number
+            ))
+
+            conversation_id = cursor.lastrowid
+
+            await db.commit()
+
+            return conversation_id
+
+    async def get_recent_conversations(
+        self,
+        limit: int = 20
+    ) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    id,
+                    user_message,
+                    assistant_response,
+                    turn_number,
+                    created_at
+                FROM conversations
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,))
+
+            rows = await cursor.fetchall()
+
+            results = [dict(row) for row in rows]
+            results.reverse()
+
+            return results
+
+    async def store_personality_trait(
+        self,
+        trait_name: str,
+        trait_value: str,
+        confidence: float = 1.0
+    ):
+        trait_name = (
+            trait_name
+            .strip()
+            .lower()
+            .replace(" ", "_")
+        )
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                SELECT id
+                FROM personality_traits
+                WHERE trait_name = ?
+            """, (trait_name,))
+
+            existing = await cursor.fetchone()
+
+            if existing:
+                await db.execute("""
+                    UPDATE personality_traits
+                    SET
+                        trait_value = ?,
+                        confidence = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    trait_value,
+                    confidence,
+                    existing[0]
+                ))
+            else:
+                await db.execute("""
+                    INSERT INTO personality_traits (
+                        trait_name,
+                        trait_value,
+                        confidence
+                    )
+                    VALUES (?, ?, ?)
+                """, (
+                    trait_name,
+                    trait_value,
+                    confidence
+                ))
+
+            await db.commit()
+
+    async def get_personality_traits(self) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute("""
+                SELECT
+                    id,
+                    trait_name,
+                    trait_value,
+                    confidence,
+                    created_at,
+                    updated_at
                 FROM personality_traits
                 ORDER BY updated_at DESC
             """)
+
             rows = await cursor.fetchall()
+
             return [dict(row) for row in rows]
-    
+
+    async def get_memory_stats(self) -> dict:
+        async with aiosqlite.connect(self.db_path) as db:
+            facts = await db.execute(
+                "SELECT COUNT(*) FROM facts"
+            )
+            facts_count = (await facts.fetchone())[0]
+
+            entities = await db.execute(
+                "SELECT COUNT(*) FROM entities"
+            )
+            entities_count = (await entities.fetchone())[0]
+
+            conversations = await db.execute(
+                "SELECT COUNT(*) FROM conversations"
+            )
+            conversations_count = (await conversations.fetchone())[0]
+
+            traits = await db.execute(
+                "SELECT COUNT(*) FROM personality_traits"
+            )
+            traits_count = (await traits.fetchone())[0]
+
+            relationships = await db.execute(
+                "SELECT COUNT(*) FROM entity_relationships"
+            )
+            relationships_count = (await relationships.fetchone())[0]
+
+        return {
+            "facts": facts_count,
+            "entities": entities_count,
+            "conversations": conversations_count,
+            "personality_traits": traits_count,
+            "relationships": relationships_count
+        }
+
+    async def debug_entity(
+        self,
+        entity_name: str
+    ) -> dict:
+        entity = await self.get_entity_by_name(entity_name)
+
+        if not entity:
+            return {
+                "entity": None,
+                "facts": [],
+                "relationships": []
+            }
+
+        facts = await self.get_facts_for_entity(
+            entity["id"]
+        )
+
+        relationships = await self.get_relationships(
+            entity["id"]
+        )
+
+        return {
+            "entity": entity,
+            "facts": facts,
+            "relationships": relationships
+        }
+
     @staticmethod
-    def _cosine_similarity(vec1: list, vec2: list) -> float:
-        """Calculate cosine similarity between two vectors"""
-        if not vec1 or not vec2 or len(vec1) != len(vec2):
+    def _cosine_similarity(
+        vec1: list,
+        vec2: list
+    ) -> float:
+        if not vec1 or not vec2:
             return 0.0
-        
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        norm1 = sum(a ** 2 for a in vec1) ** 0.5
-        norm2 = sum(b ** 2 for b in vec2) ** 0.5
-        
+
+        if len(vec1) != len(vec2):
+            return 0.0
+
+        dot_product = sum(
+            a * b
+            for a, b in zip(vec1, vec2)
+        )
+
+        norm1 = sum(
+            a ** 2
+            for a in vec1
+        ) ** 0.5
+
+        norm2 = sum(
+            b ** 2
+            for b in vec2
+        ) ** 0.5
+
         if norm1 == 0.0 or norm2 == 0.0:
             return 0.0
-        
+
         return dot_product / (norm1 * norm2)
-    
-    @staticmethod
-    def _get_recency_score(timestamp_str: str) -> float:
-        """Convert timestamp to recency score (0-1)"""
-        try:
-            dt = datetime.fromisoformat(timestamp_str)
-            now = datetime.now()
-            age_seconds = (now - dt).total_seconds()
-            
-            # Decay: recent = 1.0, 1 day old = 0.5, 7 days old = 0.1
-            max_age = 7 * 24 * 3600  # 7 days in seconds
-            recency = max(0.0, 1.0 - (age_seconds / max_age))
-            return recency
-        except:
-            return 0.5  # Default mid-score if parsing fails
