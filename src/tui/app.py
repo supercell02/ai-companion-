@@ -57,7 +57,7 @@ class CompanionApp(App):
         self.chat_log = self.query_one("#chat-display", RichLog)
         self.input = self.query_one("#user-input", Input)
         self.input.focus()
-        self.chat_log.write("[bold green]Alex:[/bold green] Hey! What's on your mind today?")
+        self.chat_log.write("[bold green]Alex:[/bold green] Hi! I'm here to chat. What's on your mind?")
     
     @on(Input.Submitted)
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -74,3 +74,5 @@ class CompanionApp(App):
             self.chat_log.write(f"[bold green]Alex:[/bold green] {response}")
         except Exception as e:
             self.chat_log.write(f"[bold red]Error:[/bold red] {str(e)}")
+            import traceback
+            traceback.print_exc()

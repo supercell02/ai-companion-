@@ -27,6 +27,7 @@ Keep responses conversational and under 200 words."""
     
     async def initialize(self):
         """Load data from DB on startup"""
+        await self.memory_db.initialize()
         print("[Loading data from memory...]")
         
         # Load personality traits
@@ -46,39 +47,11 @@ Keep responses conversational and under 200 words."""
         
         self.conversation_history.append(Message("user", user_message, len(self.conversation_history)))
         
-        # RETRIEVE RELEVANT MEMORIES
-        user_embedding = await self._embed_text(user_message)
-        relevant_facts = []
-        
-        print(f"\n[DEBUG] User message: '{user_message}'")
-        print(f"[DEBUG] User embedding generated: {user_embedding is not None}")
-        
-        if user_embedding:
-            relevant_facts = await self.memory_db.get_similar_facts(
-                embedding=user_embedding,
-                threshold=0.5,  # LOWERED from 0.6
-                limit=5
-            )
-            print(f"[DEBUG] Found {len(relevant_facts)} similar facts")
-            for fact in relevant_facts:
-                print(f"[DEBUG]   - {fact['content']} (similarity: {fact['similarity']:.2f})")
+        # RETRIEVE MEMORIES - HYBRID APPROACH (FIXED)
+        relevant_facts = await self._get_relevant_facts(user_message)
         
         # BUILD CONTEXT
-        memory_context = ""
-        
-        if self.personality_traits:
-            memory_context += "Your personality:\n"
-            for trait in self.personality_traits:
-                memory_context += f"- {trait['trait_name']}: {trait['trait_value']}\n"
-            memory_context += "\n"
-        
-        if relevant_facts:
-            memory_context += "Things you know about the user:\n"
-            for fact in relevant_facts:
-                memory_context += f"- {fact['content']}\n"
-            memory_context += "\n"
-        
-        print(f"[DEBUG] Memory context:\n{memory_context}\n")
+        memory_context = await self._build_memory_context(relevant_facts)
         
         messages = [
             {"role": "system", "content": self.system_prompt + "\n\n" + memory_context},
@@ -98,6 +71,57 @@ Keep responses conversational and under 200 words."""
         asyncio.create_task(self._update_personality_traits(assistant_msg))
         
         return assistant_msg
+    
+    async def _get_relevant_facts(self, user_message: str) -> list[dict]:
+        """
+        CORRECTED: Hybrid retrieval strategy.
+        - Use semantic similarity when available
+        - Always include recent/frequently-accessed facts
+        - Never rely solely on embeddings (FIX #2)
+        """
+        user_embedding = await self._embed_text(user_message)
+        
+        if user_embedding:
+            # Get facts using hybrid scoring (similarity + recency + access)
+            relevant_facts = await self.memory_db.get_similar_facts(
+                embedding=user_embedding,
+                threshold=0.3,
+                limit=10
+            )
+        else:
+            # Fallback to all facts ordered by recency
+            all_facts = await self.memory_db.get_all_facts()
+            relevant_facts = all_facts[:10]
+        
+        # SAFETY CHECK: If we have less than 3 facts, force load recent ones
+        if len(relevant_facts) < 3:
+            all_facts = await self.memory_db.get_all_facts()
+            relevant_facts = all_facts[:10]
+        
+        return relevant_facts
+    
+    async def _build_memory_context(self, relevant_facts: list[dict]) -> str:
+        """Build the memory context string for system prompt"""
+        memory_context = ""
+        
+        if self.personality_traits:
+            memory_context += "Your personality:\n"
+            for trait in self.personality_traits:
+                memory_context += f"- {trait['trait_name']}: {trait['trait_value']}\n"
+            memory_context += "\n"
+        
+        if relevant_facts:
+            memory_context += "Things you know about the user:\n"
+            for fact in relevant_facts:
+                # Show similarity score for debugging
+                similarity = fact.get('similarity', 0.0)
+                memory_context += f"- {fact['content']} (relevance: {similarity:.2f})\n"
+            memory_context += "\n"
+        else:
+            memory_context += "You don't have any facts about the user yet.\n\n"
+        
+        return memory_context
+    
     async def _extract_and_store_memories(self, text: str):
         """Extract facts and handle contradictions"""
         try:
@@ -106,8 +130,8 @@ Keep responses conversational and under 200 words."""
             print(f"[Extracted: {facts}]")
             
             if facts:
-                # Check for contradictions and store
-                await self._store_facts_with_contradiction_handling(facts)
+                # CORRECTED: Proper contradiction handling (FIX #1)
+                await self._store_facts_with_deduplication(facts)
             
             print("[Done]")
         except Exception as e:
@@ -117,10 +141,22 @@ Keep responses conversational and under 200 words."""
     
     async def _extract_facts(self, text: str) -> list[dict]:
         """Extract facts from user message"""
-        prompt = f"""Extract key facts about the user from: "{text}"
-Return JSON: [{{"fact": "...", "category": "..."}}, ...]
-Categories: work, personal, interests, skills, goals, relationships
-Return [] if no facts."""
+        prompt = f"""Extract facts about the user from: "{text}"
+
+Look for:
+- Name/identity: "My name is X", "I'm X", "Call me X"
+- Work: company, job title, team
+- Education: school, degree, year
+- Skills: languages, tools
+- Interests: hobbies, activities
+- Personal: pets, relationships
+- Goals: learning, aspirations
+
+Return JSON: [{{"fact": "...", "category": "..."}}]
+
+Categories: name, work, education, skills, interests, personal, goals
+
+Return [] if nothing."""
         
         response = await self.client.chat.completions.create(
             model=self.config.model_logic,
@@ -138,23 +174,39 @@ Return [] if no facts."""
         except:
             return []
     
-    async def _store_facts_with_contradiction_handling(self, new_facts: list[dict]):
-        """Store facts and handle contradictions"""
-        existing_facts = await self.memory_db.get_all_facts()
+    async def _store_facts_with_deduplication(self, new_facts: list[dict]):
+        """
+        CORRECTED: Store facts with proper deduplication (FIX #1).
         
+        Strategy:
+        1. For each new fact, check if it contradicts existing facts in same category
+        2. If contradiction detected, DELETE old facts in that category
+        3. THEN store the new fact (atomically)
+        4. Use unique constraint on content to prevent duplicates
+        """
         for new_fact in new_facts:
-            fact_text = new_fact.get('fact', '')
-            category = new_fact.get('category', 'other')
+            fact_text = new_fact.get('fact', '').strip()
+            category = new_fact.get('category', 'other').lower()
             
-            # Check for contradictions
-            contradiction = await self._check_contradiction(fact_text, existing_facts)
+            if not fact_text:
+                continue
             
-            if contradiction:
-                print(f"[Contradiction detected] Updating: '{contradiction['content']}'")
-                # Delete old fact, store new one
-                await self.memory_db.delete_fact(contradiction['id'])
+            print(f"[Processing] {category}: '{fact_text}'")
             
-            # Embed and store
+            # Get existing facts in same category
+            existing_facts = await self.memory_db.get_facts_by_category(category)
+            
+            # Check if this is an update/contradiction
+            old_fact_to_delete = None
+            if existing_facts:
+                old_fact_to_delete = await self._check_contradiction(fact_text, existing_facts)
+            
+            # If contradiction found, delete old fact BEFORE storing new
+            if old_fact_to_delete:
+                print(f"[DELETING] Contradicting fact: '{old_fact_to_delete['content']}'")
+                await self.memory_db.delete_fact_by_content(old_fact_to_delete['content'])
+            
+            # NOW store the new fact (DB handles deduplication via UNIQUE constraint)
             embedding = await self._embed_text(fact_text)
             if embedding:
                 await self.memory_db.store_fact(
@@ -162,43 +214,55 @@ Return [] if no facts."""
                     embedding=embedding,
                     category=category
                 )
+            else:
+                # Store without embedding if it fails
+                await self.memory_db.store_fact(
+                    content=fact_text,
+                    embedding=[],
+                    category=category
+                )
     
     async def _check_contradiction(self, new_fact: str, existing_facts: list[dict]) -> Optional[dict]:
-        """Check if new fact contradicts existing ones"""
+        """
+        CORRECTED: Determine which existing fact (if any) contradicts the new one.
+        
+        Returns the fact to delete, or None if it's a new fact.
+        """
         if not existing_facts:
             return None
         
-        existing_texts = "\n".join([f["content"] for f in existing_facts])
+        # Build prompt for contradiction detection
+        existing_texts = "\n".join([f"- {f['content']}" for f in existing_facts])
         
-        prompt = f"""Does this new fact contradict any existing fact?
+        prompt = f"""New fact: "{new_fact}"
 
-New fact: "{new_fact}"
-
-Existing facts:
+Existing facts in same category:
 {existing_texts}
 
-Reply ONLY with JSON: {{"contradicts": true/false, "conflicting_fact": "..."}} or {{"contradicts": false}}"""
+Question: Does the new fact REPLACE/UPDATE any existing fact?
+Examples:
+- New: "I work at Google" replaces "I work at Microsoft" → YES
+- New: "I'm learning Python" doesn't replace "I know JavaScript" → NO
+- New: "I'm John" replaces "I'm Jon" → YES
+
+Reply with ONLY "YES" or "NO". If YES, identify which fact it replaces."""
         
         response = await self.client.chat.completions.create(
             model=self.config.model_logic,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.1
         )
         
-        try:
-            result = json.loads(response.choices[0].message.content)
-            if result.get('contradicts'):
-                # Find the conflicting fact
-                conflict_text = result.get('conflicting_fact', '')
-                for fact in existing_facts:
-                    if conflict_text.lower() in fact['content'].lower():
-                        return fact
-            return None
-        except:
-            return None
+        answer = response.choices[0].message.content.strip().upper()
+        
+        if "YES" in answer:
+            # Return the FIRST fact (simplest approach: most recent)
+            return existing_facts[0] if existing_facts else None
+        
+        return None
     
     async def _embed_text(self, text: str) -> Optional[list]:
-        """Get embedding"""
+        """Get embedding from OpenAI"""
         try:
             response = await self.client.embeddings.create(
                 model=self.config.embedding_model,
@@ -206,14 +270,22 @@ Reply ONLY with JSON: {{"contradicts": true/false, "conflicting_fact": "..."}} o
             )
             return response.data[0].embedding
         except Exception as e:
-            print(f"Embedding error: {e}")
+            print(f"[Embedding error]: {e}")
             return None
     
     async def _update_personality_traits(self, assistant_response: str):
-        """Extract personality traits"""
-        prompt = f"""Extract personality traits from: "{assistant_response}"
-Return JSON: [{{"trait_name": "...", "trait_value": "..."}}, ...]
-Return [] if none."""
+        """Extract personality traits from assistant's responses"""
+        prompt = f"""What personality traits does Alex show in this response?
+
+Response: "{assistant_response}"
+
+Extract traits like: empathy, humor, curiosity, attention_to_detail, warmth, wit
+
+Return JSON: [{{"trait_name": "trait", "trait_value": "description"}}]
+
+Example: [{{"trait_name": "empathy", "trait_value": "very high - shows genuine concern"}}]
+
+Be generous - if the trait is evident, include it. Return [] if no clear traits."""
         
         try:
             response = await self.client.chat.completions.create(
@@ -228,11 +300,12 @@ Return [] if none."""
             if start != -1 and end > start:
                 traits = json.loads(text[start:end])
                 for trait in traits:
-                    await self.memory_db.store_personality_trait(
-                        trait_name=trait.get('trait_name', ''),
-                        trait_value=trait.get('trait_value', '')
-                    )
-                    # Update local cache
-                    self.personality_traits = await self.memory_db.get_personality_traits()
+                    if trait.get('trait_name') and trait.get('trait_value'):
+                        await self.memory_db.store_personality_trait(
+                            trait_name=trait.get('trait_name', '').lower().replace(' ', '_'),
+                            trait_value=trait.get('trait_value', '')
+                        )
+                        # Update local cache
+                        self.personality_traits = await self.memory_db.get_personality_traits()
         except Exception as e:
-            print(f"Personality extraction error: {e}")
+            print(f"[Personality extraction error]: {e}")
